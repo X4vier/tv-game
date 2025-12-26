@@ -34,6 +34,7 @@ class TvController {
   private pollingInterval: ReturnType<typeof setInterval> | null = null;
   private pendingDirection: Direction | null = null;
   private lastProcessedCandidateIndex = 0;
+  private hasProcessedAnswer = false;
 
   constructor() {
     makeObservable(this);
@@ -124,9 +125,13 @@ class TvController {
   }
 
   private async pollForAnswer() {
-    const { answer } = await this.trpc.signaling.getPhoneAnswer.query();
-    if (answer && this.peer) {
-      this.peer.signal({ type: answer.type, sdp: answer.sdp });
+    // Only process the answer once
+    if (!this.hasProcessedAnswer) {
+      const { answer } = await this.trpc.signaling.getPhoneAnswer.query();
+      if (answer && this.peer) {
+        this.hasProcessedAnswer = true;
+        this.peer.signal({ type: answer.type, sdp: answer.sdp });
+      }
     }
 
     // Also check for ICE candidates
@@ -211,6 +216,7 @@ class TvController {
   private async reinitialize() {
     await this.trpc.signaling.clear.mutate();
     this.lastProcessedCandidateIndex = 0;
+    this.hasProcessedAnswer = false;
     this.peer = null;
     this.gameState = createInitialState();
     await this.initializeWebRTC();
