@@ -48,6 +48,13 @@ class TvController {
     this.peer = new Peer({
       initiator: true,
       trickle: true,
+      config: {
+        iceServers: [
+          { urls: "stun:stun.l.google.com:19302" },
+          { urls: "stun:stun1.l.google.com:19302" },
+          { urls: "stun:stun2.l.google.com:19302" },
+        ],
+      },
     });
 
     this.peer.on("signal", (data) => {
