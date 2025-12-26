@@ -39,8 +39,12 @@ class PhoneController {
 
   private trpc = getTrpcClient();
   private peer: Peer.Instance | null = null;
+  private sessionId: string | null = null;
+  private phoneId: string | null = null;
   private pollingInterval: ReturnType<typeof setInterval> | null = null;
-  private lastProcessedCandidateIndex = 0;
+  private iceCandidatePollingInterval: ReturnType<typeof setInterval> | null = null;
+  private lastTvCandidateIndex = 0;
+  private pendingIceCandidates: IceCandidateSignal[] = [];
 
   constructor() {
     makeObservable(this);
@@ -53,34 +57,47 @@ class PhoneController {
     log("connectToTv starting");
     this.connectionStatus = "connecting";
 
-    // Poll for TV's offer
-    log("Starting polling for TV offer (every 1s)");
+    // Poll for available TV session
+    log("Starting polling for TV session (every 1s)");
     this.pollingInterval = setInterval(() => {
-      void this.pollForTvOffer();
+      void this.pollForTvSession();
     }, 1000);
   }
 
-  private async pollForTvOffer() {
-    log("Polling for TV offer...");
-    const { offer } = await this.trpc.signaling.getTvOffer.query();
-    log("Got offer response", { hasOffer: !!offer, hasPeer: !!this.peer });
+  private async pollForTvSession() {
+    log("Polling for TV session...");
+    const { session } = await this.trpc.signaling.getAvailableSession.query();
+    log("Got session response", { hasSession: !!session });
 
-    if (offer && !this.peer) {
-      log("Found TV offer, creating peer connection", { sdpLength: offer.sdp.length });
+    if (session && !this.peer) {
+      log("Found TV session", {
+        sessionId: session.sessionId,
+        offerLength: session.offer.sdp.length,
+        tvCandidateCount: session.tvIceCandidates.length,
+      });
       this.stopPolling();
-      this.createPeerAndConnect(offer);
+      this.sessionId = session.sessionId;
+      this.createPeerAndConnect(session.offer, session.tvIceCandidates);
     }
   }
 
   private stopPolling() {
-    log("Stopping polling");
+    log("Stopping session polling");
     if (this.pollingInterval) {
       clearInterval(this.pollingInterval);
       this.pollingInterval = null;
     }
   }
 
-  private createPeerAndConnect(offer: SdpSignal) {
+  private stopIceCandidatePolling() {
+    log("Stopping ICE candidate polling");
+    if (this.iceCandidatePollingInterval) {
+      clearInterval(this.iceCandidatePollingInterval);
+      this.iceCandidatePollingInterval = null;
+    }
+  }
+
+  private createPeerAndConnect(offer: SdpSignal, initialTvCandidates: IceCandidateSignal[]) {
     log("Creating peer (non-initiator) with STUN servers");
     this.peer = new Peer({
       initiator: false,
@@ -101,6 +118,7 @@ class PhoneController {
 
     this.peer.on("connect", () => {
       log("Peer CONNECTED! Data channel is open");
+      this.stopIceCandidatePolling();
       runInAction(() => {
         this.isConnected = true;
         this.connectionStatus = "connected";
@@ -134,57 +152,74 @@ class PhoneController {
     log("Peer event handlers registered, signaling TV offer to peer");
     // Signal the offer to establish connection
     this.peer.signal({ type: offer.type, sdp: offer.sdp });
-    log("Offer signaled, starting to poll for TV ICE candidates");
 
-    // Also fetch any ICE candidates from TV
-    void this.pollForIceCandidates();
-  }
+    // Signal initial TV ICE candidates
+    this.lastTvCandidateIndex = initialTvCandidates.length;
+    for (const candidate of initialTvCandidates) {
+      log("Signaling initial TV ICE candidate");
+      this.peer.signal({
+        type: "candidate",
+        candidate: candidate.candidate as unknown as RTCIceCandidate,
+      });
+    }
 
-  private pollForIceCandidates() {
-    log("Starting ICE candidate polling (every 500ms)");
-    const pollInterval = setInterval(() => {
-      if (!this.peer || this.connectionStatus === "connected") {
-        log("Stopping ICE candidate polling", { hasPeer: !!this.peer, connectionStatus: this.connectionStatus });
-        clearInterval(pollInterval);
-        return;
-      }
-
-      void this.fetchAndProcessIceCandidates();
+    log("Starting ICE candidate polling");
+    // Poll for additional TV ICE candidates
+    this.iceCandidatePollingInterval = setInterval(() => {
+      void this.pollForTvIceCandidates();
     }, 500);
   }
 
-  private async fetchAndProcessIceCandidates() {
-    const { candidates } = await this.trpc.signaling.getTvIceCandidates.query();
-    const newCount = candidates.length - this.lastProcessedCandidateIndex;
-    if (newCount > 0) {
-      log("Got TV ICE candidates", { total: candidates.length, newCount });
+  private async pollForTvIceCandidates() {
+    if (!this.sessionId || !this.peer || this.connectionStatus === "connected") {
+      return;
     }
-    if (candidates.length > this.lastProcessedCandidateIndex) {
-      for (let i = this.lastProcessedCandidateIndex; i < candidates.length; i++) {
-        const candidate = candidates[i];
-        if (candidate && this.peer) {
-          log("Processing TV ICE candidate", { index: i, candidate: candidate.candidate.candidate.slice(0, 50) + "..." });
-          this.peer.signal({
-            type: "candidate",
-            candidate: candidate.candidate as unknown as RTCIceCandidate,
-          });
-        }
+
+    const { candidates, nextIndex } = await this.trpc.signaling.getTvIceCandidates.query({
+      sessionId: this.sessionId,
+      afterIndex: this.lastTvCandidateIndex,
+    });
+
+    if (candidates.length > 0) {
+      log("Got new TV ICE candidates", { count: candidates.length });
+      for (const candidate of candidates) {
+        log("Signaling TV ICE candidate to peer");
+        this.peer.signal({
+          type: "candidate",
+          candidate: candidate.candidate as unknown as RTCIceCandidate,
+        });
       }
-      this.lastProcessedCandidateIndex = candidates.length;
+      this.lastTvCandidateIndex = nextIndex;
     }
   }
 
   private async handleSignal(data: Peer.SignalData) {
     if (data.type === "answer" && data.sdp) {
-      log("Sending ANSWER to signaling server", { sdpLength: data.sdp.length });
-      const answer: SdpSignal = { type: "answer", sdp: data.sdp };
-      await this.trpc.signaling.sendPhoneAnswer.mutate({ answer });
-      log("Answer sent successfully");
-    } else if ("candidate" in data && data.candidate) {
-      log("Sending ICE candidate to signaling server", {
-        candidate: data.candidate.candidate.slice(0, 50) + "...",
-        sdpMid: data.candidate.sdpMid
+      log("Got answer from peer, joining session", { sdpLength: data.sdp.length });
+
+      if (!this.sessionId) {
+        log("No sessionId, cannot join");
+        return;
+      }
+
+      // Join the session with our answer
+      const { phoneId } = await this.trpc.signaling.joinSession.mutate({
+        sessionId: this.sessionId,
+        answer: { type: "answer", sdp: data.sdp },
       });
+
+      this.phoneId = phoneId;
+      log("Joined session", { phoneId });
+
+      // Send any pending ICE candidates
+      for (const candidate of this.pendingIceCandidates) {
+        await this.trpc.signaling.addPhoneIceCandidate.mutate({
+          phoneId,
+          candidate,
+        });
+      }
+      this.pendingIceCandidates = [];
+    } else if ("candidate" in data && data.candidate) {
       const candidate: IceCandidateSignal = {
         candidate: {
           candidate: data.candidate.candidate,
@@ -192,8 +227,20 @@ class PhoneController {
           sdpMid: data.candidate.sdpMid ?? null,
         },
       };
-      await this.trpc.signaling.addPhoneIceCandidate.mutate({ candidate });
-      log("ICE candidate sent successfully");
+
+      if (this.phoneId) {
+        log("Sending ICE candidate to signaling server", {
+          candidate: data.candidate.candidate.slice(0, 50) + "...",
+        });
+        await this.trpc.signaling.addPhoneIceCandidate.mutate({
+          phoneId: this.phoneId,
+          candidate,
+        });
+      } else {
+        // Queue until we have a phoneId
+        log("Queueing ICE candidate (no phoneId yet)");
+        this.pendingIceCandidates.push(candidate);
+      }
     }
   }
 
@@ -237,12 +284,17 @@ class PhoneController {
   private async reinitialize() {
     log("Reinitializing connection...");
     this.peer = null;
-    this.lastProcessedCandidateIndex = 0;
+    this.sessionId = null;
+    this.phoneId = null;
+    this.lastTvCandidateIndex = 0;
+    this.pendingIceCandidates = [];
+    this.stopIceCandidatePolling();
     await this.connectToTv();
   }
 
   destroy() {
     this.stopPolling();
+    this.stopIceCandidatePolling();
     if (this.peer) {
       this.peer.destroy();
       this.peer = null;

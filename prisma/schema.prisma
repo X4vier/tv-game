@@ -19,3 +19,53 @@ model Post {
 
     @@index([name])
 }
+
+// WebRTC Signaling Models
+
+// A session represents a TV waiting for phone connections
+model SignalingSession {
+    id        String   @id @default(cuid())
+    tvOffer   Json? // SDP offer from TV
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+
+    // TV's ICE candidates
+    tvIceCandidates IceCandidate[]
+
+    // Phones that have connected to this session
+    phoneConnections PhoneConnection[]
+}
+
+// A phone connection to a session
+model PhoneConnection {
+    id        String   @id @default(cuid())
+    sessionId String
+    session   SignalingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+    answer    Json? // SDP answer from phone
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+
+    // Phone's ICE candidates
+    iceCandidates IceCandidate[]
+
+    @@index([sessionId])
+}
+
+// ICE candidates - can be from TV (sessionId set) or Phone (phoneConnectionId set)
+model IceCandidate {
+    id        String   @id @default(cuid())
+    candidate Json
+    createdAt DateTime @default(now())
+
+    // If from TV, links to session
+    sessionId String?
+    session   SignalingSession? @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+    // If from phone, links to phone connection
+    phoneConnectionId String?
+    phoneConnection   PhoneConnection? @relation(fields: [phoneConnectionId], references: [id], onDelete: Cascade)
+
+    @@index([sessionId])
+    @@index([phoneConnectionId])
+}

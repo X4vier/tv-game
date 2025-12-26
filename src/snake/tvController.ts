@@ -32,34 +32,42 @@ export function getTvController() {
   return tvController;
 }
 
+// Track a connected phone
+type PhoneConnection = {
+  phoneId: string;
+  peer: Peer.Instance;
+  connected: boolean;
+  lastCandidateIndex: number;
+};
+
 class TvController {
   @observable gameState: GameState = createInitialState();
   @observable phoneConnected = false;
   @observable connectionStatus: "disconnected" | "waiting" | "connected" =
     "disconnected";
+  @observable connectedPhoneCount = 0;
 
   private trpc = getTrpcClient();
-  private peer: Peer.Instance | null = null;
+  private sessionId: string | null = null;
+  private phones = new Map<string, PhoneConnection>();
   private gameInterval: ReturnType<typeof setInterval> | null = null;
   private pollingInterval: ReturnType<typeof setInterval> | null = null;
   private pendingDirection: Direction | null = null;
-  private lastProcessedCandidateIndex = 0;
-  private hasProcessedAnswer = false;
 
   constructor() {
     makeObservable(this);
     log("TvController constructor called");
-    void this.initializeWebRTC();
+    void this.initializeSession();
   }
 
   @action
-  private async initializeWebRTC() {
-    log("initializeWebRTC starting");
+  private async initializeSession() {
+    log("initializeSession starting");
     this.connectionStatus = "waiting";
 
     // Create peer as initiator
-    log("Creating peer as initiator with STUN servers");
-    this.peer = new Peer({
+    log("Creating initiator peer with STUN servers");
+    const peer = new Peer({
       initiator: true,
       trickle: true,
       config: {
@@ -71,76 +79,71 @@ class TvController {
       },
     });
 
-    this.peer.on("signal", (data) => {
-      log("Peer emitted signal event", { type: data.type, hasCandidate: "candidate" in data });
-      void this.handleSignal(data);
+    // Wait for the offer signal
+    peer.on("signal", (data) => {
+      void this.handlePeerSignal(data);
     });
 
-    this.peer.on("connect", () => {
-      log("Peer CONNECTED! Data channel is open");
-      runInAction(() => {
-        this.phoneConnected = true;
-        this.connectionStatus = "connected";
-      });
-      this.stopPolling();
-      this.sendGameState();
-    });
-
-    this.peer.on("data", (data: Uint8Array) => {
-      log("Received data from phone", data.toString());
-      this.handlePhoneMessage(data);
-    });
-
-    this.peer.on("close", () => {
-      log("Peer connection CLOSED");
-      runInAction(() => {
-        this.phoneConnected = false;
-        this.connectionStatus = "disconnected";
-      });
-      this.stopGame();
-      // Reinitialize for next connection
-      void this.reinitialize();
-    });
-
-    this.peer.on("error", (err) => {
-      log("Peer ERROR", { message: err.message, name: err.name, stack: err.stack });
-      runInAction(() => {
-        this.phoneConnected = false;
-        this.connectionStatus = "disconnected";
-      });
-    });
-
+    // Store the peer temporarily for signaling
+    // We'll create per-phone peers when phones connect
+    this._initiatorPeer = peer;
     log("Peer event handlers registered");
   }
 
-  private async handleSignal(data: Peer.SignalData) {
+  private _initiatorPeer: Peer.Instance | null = null;
+  private _processedPhones = new Set<string>();
+  private _pendingIceCandidates: Array<{ candidate: string; sdpMLineIndex: number | null; sdpMid: string | null }> = [];
+
+  private async handlePeerSignal(data: Peer.SignalData) {
     if (data.type === "offer" && data.sdp) {
-      log("Sending OFFER to signaling server", { sdpLength: data.sdp.length });
-      const offer: SdpSignal = { type: "offer", sdp: data.sdp };
-      await this.trpc.signaling.registerTvOffer.mutate({ offer });
-      log("Offer registered, starting to poll for answer");
-      this.startPollingForAnswer();
-    } else if ("candidate" in data && data.candidate) {
-      log("Sending ICE candidate to signaling server", {
-        candidate: data.candidate.candidate.slice(0, 50) + "...",
-        sdpMid: data.candidate.sdpMid
+      log("Got offer from peer, creating session", { sdpLength: data.sdp.length });
+
+      // Create session with offer
+      const { sessionId } = await this.trpc.signaling.createSession.mutate({
+        offer: { type: "offer", sdp: data.sdp },
       });
-      const candidate: IceCandidateSignal = {
-        candidate: {
-          candidate: data.candidate.candidate,
-          sdpMLineIndex: data.candidate.sdpMLineIndex ?? null,
-          sdpMid: data.candidate.sdpMid ?? null,
-        },
+
+      this.sessionId = sessionId;
+      log("Session created", { sessionId });
+
+      // Send any pending ICE candidates
+      for (const candidate of this._pendingIceCandidates) {
+        await this.trpc.signaling.addTvIceCandidate.mutate({
+          sessionId,
+          candidate: { candidate },
+        });
+      }
+      this._pendingIceCandidates = [];
+
+      // Start polling for phone connections
+      this.startPollingForPhones();
+    } else if ("candidate" in data && data.candidate) {
+      const candidateData = {
+        candidate: data.candidate.candidate,
+        sdpMLineIndex: data.candidate.sdpMLineIndex ?? null,
+        sdpMid: data.candidate.sdpMid ?? null,
       };
-      await this.trpc.signaling.addTvIceCandidate.mutate({ candidate });
-      log("ICE candidate sent successfully");
+
+      if (this.sessionId) {
+        log("Sending TV ICE candidate", {
+          candidate: data.candidate.candidate.slice(0, 50) + "...",
+        });
+        await this.trpc.signaling.addTvIceCandidate.mutate({
+          sessionId: this.sessionId,
+          candidate: { candidate: candidateData },
+        });
+      } else {
+        // Queue until we have a session
+        log("Queueing TV ICE candidate (no session yet)");
+        this._pendingIceCandidates.push(candidateData);
+      }
     }
   }
 
-  private startPollingForAnswer() {
-    log("Starting polling for phone answer (every 1s)");
+  private startPollingForPhones() {
+    log("Starting polling for phone connections (every 1s)");
     this.pollingInterval = setInterval(() => {
-      void this.pollForAnswer();
+      void this.pollForPhones();
     }, 1000);
   }
 
@@ -152,36 +155,122 @@ class TvController {
     }
   }
 
-  private async pollForAnswer() {
-    log("Polling...", { hasProcessedAnswer: this.hasProcessedAnswer, lastCandidateIdx: this.lastProcessedCandidateIndex });
+  private async pollForPhones() {
+    if (!this.sessionId) return;
 
-    // Only process the answer once
-    if (!this.hasProcessedAnswer) {
-      const { answer } = await this.trpc.signaling.getPhoneAnswer.query();
-      log("Got answer response", { hasAnswer: !!answer });
-      if (answer && this.peer) {
-        log("Processing phone ANSWER", { sdpLength: answer.sdp.length });
-        this.hasProcessedAnswer = true;
-        this.peer.signal({ type: answer.type, sdp: answer.sdp });
-        log("Answer signaled to peer");
-      }
-    }
+    const { connections } = await this.trpc.signaling.getPhoneConnections.query({
+      sessionId: this.sessionId,
+    });
 
-    // Also check for ICE candidates
-    const { candidates } = await this.trpc.signaling.getPhoneIceCandidates.query();
-    log("Got ICE candidates", { total: candidates.length, newCount: candidates.length - this.lastProcessedCandidateIndex });
-    if (candidates.length > this.lastProcessedCandidateIndex) {
-      for (let i = this.lastProcessedCandidateIndex; i < candidates.length; i++) {
-        const candidate = candidates[i];
-        if (candidate && this.peer) {
-          log("Processing phone ICE candidate", { index: i, candidate: candidate.candidate.candidate.slice(0, 50) + "..." });
-          this.peer.signal({
-            type: "candidate",
-            candidate: candidate.candidate as unknown as RTCIceCandidate,
-          });
+    log("Polled for phones", {
+      connectionCount: connections.length,
+      processedCount: this._processedPhones.size
+    });
+
+    for (const conn of connections) {
+      // Process new phones
+      if (!this._processedPhones.has(conn.phoneId) && conn.answer) {
+        log("New phone connection found", { phoneId: conn.phoneId });
+        this._processedPhones.add(conn.phoneId);
+        this.handleNewPhoneConnection(conn.phoneId, conn.answer, conn.iceCandidates);
+      } else if (this._processedPhones.has(conn.phoneId)) {
+        // Check for new ICE candidates from existing phones
+        const phone = this.phones.get(conn.phoneId);
+        if (phone && conn.iceCandidates.length > phone.lastCandidateIndex) {
+          for (let i = phone.lastCandidateIndex; i < conn.iceCandidates.length; i++) {
+            const candidate = conn.iceCandidates[i];
+            if (candidate) {
+              log("Processing phone ICE candidate", { phoneId: conn.phoneId, index: i });
+              phone.peer.signal({
+                type: "candidate",
+                candidate: candidate.candidate as unknown as RTCIceCandidate,
+              });
+            }
+          }
+          phone.lastCandidateIndex = conn.iceCandidates.length;
         }
       }
-      this.lastProcessedCandidateIndex = candidates.length;
+    }
+  }
+
+  private handleNewPhoneConnection(
+    phoneId: string,
+    answer: SdpSignal,
+    iceCandidates: IceCandidateSignal[]
+  ) {
+    log("Setting up connection for phone", { phoneId, candidateCount: iceCandidates.length });
+
+    // Use the initiator peer for the first connection
+    // For multi-phone, we'd create new peers, but for now use the existing one
+    const peer = this._initiatorPeer;
+    if (!peer) {
+      log("No initiator peer available");
+      return;
+    }
+
+    // Store phone connection
+    const phoneConn: PhoneConnection = {
+      phoneId,
+      peer,
+      connected: false,
+      lastCandidateIndex: iceCandidates.length,
+    };
+    this.phones.set(phoneId, phoneConn);
+
+    // Set up peer event handlers
+    peer.on("connect", () => {
+      log("Peer CONNECTED!", { phoneId });
+      phoneConn.connected = true;
+      runInAction(() => {
+        this.phoneConnected = true;
+        this.connectionStatus = "connected";
+        this.connectedPhoneCount = Array.from(this.phones.values()).filter(p => p.connected).length;
+      });
+      this.sendGameState();
+    });
+
+    peer.on("data", (data: Uint8Array) => {
+      log("Received data from phone", { phoneId, data: data.toString() });
+      this.handlePhoneMessage(data);
+    });
+
+    peer.on("close", () => {
+      log("Peer connection CLOSED", { phoneId });
+      this.phones.delete(phoneId);
+      runInAction(() => {
+        this.connectedPhoneCount = Array.from(this.phones.values()).filter(p => p.connected).length;
+        this.phoneConnected = this.connectedPhoneCount > 0;
+        if (!this.phoneConnected) {
+          this.connectionStatus = "disconnected";
+          this.stopGame();
+          void this.reinitialize();
+        }
+      });
+    });
+
+    peer.on("error", (err) => {
+      log("Peer ERROR", { phoneId, message: err.message, name: err.name });
+      this.phones.delete(phoneId);
+      runInAction(() => {
+        this.connectedPhoneCount = Array.from(this.phones.values()).filter(p => p.connected).length;
+        this.phoneConnected = this.connectedPhoneCount > 0;
+        if (!this.phoneConnected) {
+          this.connectionStatus = "disconnected";
+        }
+      });
+    });
+
+    // Signal the answer
+    log("Signaling answer to peer", { phoneId, sdpLength: answer.sdp.length });
+    peer.signal({ type: answer.type, sdp: answer.sdp });
+
+    // Signal any ICE candidates
+    for (const candidate of iceCandidates) {
+      log("Signaling ICE candidate to peer", { phoneId });
+      peer.signal({
+        type: "candidate",
+        candidate: candidate.candidate as unknown as RTCIceCandidate,
+      });
     }
   }
 
@@ -238,33 +327,46 @@ class TvController {
   }
 
   private sendGameState() {
-    if (this.peer && this.phoneConnected) {
-      const message: TvMessage = {
-        type: "gameState",
-        status: this.gameState.status,
-        score: this.gameState.score,
-      };
-      this.peer.send(JSON.stringify(message));
+    const message: TvMessage = {
+      type: "gameState",
+      status: this.gameState.status,
+      score: this.gameState.score,
+    };
+
+    // Send to all connected phones
+    for (const phone of this.phones.values()) {
+      if (phone.connected) {
+        phone.peer.send(JSON.stringify(message));
+      }
     }
   }
 
   private async reinitialize() {
-    log("Reinitializing connection...");
-    await this.trpc.signaling.clear.mutate();
-    this.lastProcessedCandidateIndex = 0;
-    this.hasProcessedAnswer = false;
-    this.peer = null;
+    log("Reinitializing session...");
+
+    // Clear old session
+    if (this.sessionId) {
+      await this.trpc.signaling.clearSession.mutate({ sessionId: this.sessionId });
+    }
+
+    // Reset state
+    this.sessionId = null;
+    this.phones.clear();
+    this._processedPhones.clear();
+    this._pendingIceCandidates = [];
+    this._initiatorPeer = null;
     this.gameState = createInitialState();
-    log("State reset, reinitializing WebRTC");
-    await this.initializeWebRTC();
+
+    log("State reset, reinitializing");
+    await this.initializeSession();
   }
 
   destroy() {
     this.stopGame();
     this.stopPolling();
-    if (this.peer) {
-      this.peer.destroy();
-      this.peer = null;
+    for (const phone of this.phones.values()) {
+      phone.peer.destroy();
     }
+    this.phones.clear();
   }
 }
